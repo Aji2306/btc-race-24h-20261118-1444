@@ -1,8 +1,8 @@
 /**
- * Strategy: Hybrid two-tier dip-buy on CBBTC 1-minute bars (Version 2).
- * - Core Entry: Close drops >=100bps from 60-bar high and bounces >=10bps off 10-bar low, 100% of equity.
+ * Strategy: Hybrid two-tier dip-buy on CBBTC 1-minute bars (Version 3).
+ * - Core Entry: Close drops >=100bps from 60-bar high and bounces >=5bps off 10-bar low (core bounce >= 5 bps, was 10), 100% of equity.
  * - Core Exit: +120bps take-profit, -150bps trailing drawdown from peak, or 480-bar timeout.
- * - Fallback Entry: After 300 bars without a trade, drop >=50bps from 30-bar high, 25% of cash.
+ * - Fallback Entry: After 300 bars without a trade, drop >=70bps from 30-bar high (fallback dip >= 70 bps, was 50), 25% of cash.
  * - Fallback Exit: +60bps take-profit, -60bps trailing drawdown, or 240-bar timeout.
  * - Cutoff: No new entries after bar 1300.
  */
@@ -141,7 +141,7 @@ await runBars({
       const minNotional = BigInt(state.hello.fees.min_notional_quote_units ?? 1_000_000n);
 
       // CORE entry
-      if (closes.length >= 60 && dip60Bps >= 100n && bounceBps >= 10n && posValue < state.equity) {
+      if (closes.length >= 60 && dip60Bps >= 100n && bounceBps >= 5n && posValue < state.equity) {
         const notional = state.cash;
         if (notional >= minNotional && state.weightRoom('CBBTC') >= minNotional) {
           const clientId = 'o' + (++orderCounter);
@@ -157,7 +157,7 @@ await runBars({
       }
 
       // FALLBACK entry
-      if (posQty === 0n && (state.seq - lastTradeBar) >= 300 && closes.length >= 30 && dip30Bps >= 50n && bounceBps >= 10n) {
+      if (posQty === 0n && (state.seq - lastTradeBar) >= 300 && closes.length >= 30 && dip30Bps >= 70n && bounceBps >= 10n) {
         const notional = (state.cash * 25n) / 100n;
         if (notional >= minNotional && state.weightRoom('CBBTC') >= minNotional) {
           const clientId = 'o' + (++orderCounter);
