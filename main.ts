@@ -1,171 +1,183 @@
 /**
- * Strategy: Hybrid two-tier dip-buy on CBBTC 1-minute bars (Version 3).
- * - Core Entry: Close drops >=100bps from 60-bar high and bounces >=5bps off 10-bar low (core bounce >= 5 bps, was 10), 100% of equity.
- * - Core Exit: +120bps take-profit, -150bps trailing drawdown from peak, or 480-bar timeout.
- * - Fallback Entry: After 300 bars without a trade, drop >=70bps from 30-bar high (fallback dip >= 70 bps, was 50), 25% of cash.
- * - Fallback Exit: +60bps take-profit, -60bps trailing drawdown, or 240-bar timeout.
- * - Cutoff: No new entries after bar 1300.
+ * Strategy: Dual-tier pullback and bounce trading strategy on CBBTC 1-minute bars (Version 4).
+ * - Primary Entry: Triggers when the price drops >=100 bps from the 60-bar peak and rebounds >=5 bps off the 10-bar trough, deploying 100% of available equity.
+ * - Primary Exit: Target +120 bps take-profit, -150 bps trailing drawdown from peak price, or 480-bar max holding timeout.
+ * - Secondary Entry: Activated after 300 bars of inactivity when position is zero, requiring a >=70 bps dip from the 30-bar peak and >=10 bps rebound off the 10-bar trough, allocating 25% of cash.
+ * - Secondary Exit: Target +60 bps take-profit, -60 bps trailing drawdown, or 240-bar max holding timeout.
+ * - Cutoff Rule: No new positions initiated after bar 1300.
  */
 import { runBars } from './vendor/makefun-bars.ts';
 
-interface Tranche {
+interface ActiveHolding {
   id: number;
   qty: bigint;
-  entry: bigint;
-  entryBar: number;
-  peak: bigint;
-  tp: bigint;
-  trail: bigint;
-  timeout: number;
+  entryPrice: bigint;
+  entryBarNumber: number;
+  peakPrice: bigint;
+  takeProfitBps: bigint;
+  trailingBps: bigint;
+  timeoutBars: number;
 }
 
-interface PendingBuy {
-  clientId: string;
-  tp: bigint;
-  trail: bigint;
-  timeout: number;
+interface PendingBuyIntent {
+  identifier: string;
+  takeProfitBps: bigint;
+  trailingBps: bigint;
+  timeoutBars: number;
 }
 
-interface PendingSell {
-  clientId: string;
-  trancheIds: number[];
+interface PendingSellIntent {
+  identifier: string;
+  holdingIds: number[];
 }
 
-const closes: bigint[] = [];
-let tranches: Tranche[] = [];
-let nextTrancheId = 0;
-let orderCounter = 0;
-let lastTradeBar = 0;
-let pendingBuy: PendingBuy | null = null;
-let pendingSell: PendingSell | null = null;
+const priceHistory: bigint[] = [];
+let activeHoldings: ActiveHolding[] = [];
+let nextHoldingId = 0;
+let sequenceOrderCount = 0;
+let lastExecutionBar = 0;
+let pendingBuyIntent: PendingBuyIntent | null = null;
+let pendingSellIntent: PendingSellIntent | null = null;
+
+function computeWindowStats(closes: bigint[]) {
+  let high60 = 0n;
+  if (closes.length >= 60) {
+    const slice60 = closes.slice(-60);
+    high60 = slice60.reduce((m, val) => (val > m ? val : m), slice60[0]!);
+  }
+
+  let high30 = 0n;
+  if (closes.length >= 30) {
+    const slice30 = closes.slice(-30);
+    high30 = slice30.reduce((m, val) => (val > m ? val : m), slice30[0]!);
+  }
+
+  let low10 = 0n;
+  if (closes.length >= 10) {
+    const slice10 = closes.slice(-10);
+    low10 = slice10.reduce((m, val) => (val < m ? val : m), slice10[0]!);
+  }
+
+  return { high60, high30, low10 };
+}
+
+function evaluateExitOrders(holdings: ActiveHolding[], currentClose: bigint, currentSeq: number) {
+  const targetIds: number[] = [];
+  let totalSellQty = 0n;
+
+  for (const holding of holdings) {
+    if (currentClose > holding.peakPrice) {
+      holding.peakPrice = currentClose;
+    }
+    const profitBps = (currentClose - holding.entryPrice) * 10000n / holding.entryPrice;
+    const drawdownBps = (holding.peakPrice - currentClose) * 10000n / holding.peakPrice;
+
+    if (profitBps >= holding.takeProfitBps || drawdownBps >= holding.trailingBps || (currentSeq - holding.entryBarNumber) >= holding.timeoutBars) {
+      targetIds.push(holding.id);
+      totalSellQty += holding.qty;
+    }
+  }
+
+  return { targetIds, totalSellQty };
+}
 
 await runBars({
   onBatch(state, batch) {
-    const bar = state.latest.get('CBBTC');
-    if (!bar) return [];
+    const barData = state.latest.get('CBBTC');
+    if (!barData) return [];
 
-    const close = BigInt(bar.c);
-    closes.push(close);
-    if (closes.length > 300) {
-      closes.shift();
+    const currentClose = BigInt(barData.c);
+    priceHistory.push(currentClose);
+    if (priceHistory.length > 300) {
+      priceHistory.shift();
     }
 
-    // FIRST: process batch.fills
+    // 1. Process incoming execution fills first
     if (batch.fills && batch.fills.length > 0) {
       for (const fill of batch.fills) {
         if (fill.status === 'filled') {
-          lastTradeBar = state.seq;
+          lastExecutionBar = state.seq;
         }
-        if (fill.side === 'buy' && pendingBuy !== null && fill.client_id === pendingBuy.clientId) {
+        if (fill.side === 'buy' && pendingBuyIntent !== null && fill.client_id === pendingBuyIntent.identifier) {
           if (fill.status === 'filled') {
-            tranches.push({
-              id: nextTrancheId++,
+            activeHoldings.push({
+              id: nextHoldingId++,
               qty: BigInt(fill.qty),
-              entry: BigInt(fill.price),
-              entryBar: fill.fill_bar,
-              peak: BigInt(fill.price),
-              tp: pendingBuy.tp,
-              trail: pendingBuy.trail,
-              timeout: pendingBuy.timeout,
+              entryPrice: BigInt(fill.price),
+              entryBarNumber: fill.fill_bar,
+              peakPrice: BigInt(fill.price),
+              takeProfitBps: pendingBuyIntent.takeProfitBps,
+              trailingBps: pendingBuyIntent.trailingBps,
+              timeoutBars: pendingBuyIntent.timeoutBars,
             });
           }
         }
-        if (fill.side === 'sell' && pendingSell !== null && fill.client_id === pendingSell.clientId) {
+        if (fill.side === 'sell' && pendingSellIntent !== null && fill.client_id === pendingSellIntent.identifier) {
           if (fill.status === 'filled') {
-            const removeIds = new Set(pendingSell.trancheIds);
-            tranches = tranches.filter(t => !removeIds.has(t.id));
+            const removedIdsSet = new Set(pendingSellIntent.holdingIds);
+            activeHoldings = activeHoldings.filter(h => !removedIdsSet.has(h.id));
           }
         }
       }
     }
-    pendingBuy = null;
-    pendingSell = null;
+    pendingBuyIntent = null;
+    pendingSellIntent = null;
 
-    // EXITS (per tranche, only if tranches is non-empty)
-    if (tranches.length > 0) {
-      const markedIds: number[] = [];
-      let sellQty = 0n;
+    // 2. Evaluate exit conditions for all active holdings
+    if (activeHoldings.length > 0) {
+      const { targetIds, totalSellQty } = evaluateExitOrders(activeHoldings, currentClose, state.seq);
 
-      for (const t of tranches) {
-        if (close > t.peak) {
-          t.peak = close;
-        }
-        const pnlBps = (close - t.entry) * 10000n / t.entry;
-        const trailBps = (t.peak - close) * 10000n / t.peak;
-        if (pnlBps >= t.tp || trailBps >= t.trail || (state.seq - t.entryBar) >= t.timeout) {
-          markedIds.push(t.id);
-          sellQty += t.qty;
-        }
-      }
-
-      if (markedIds.length > 0 && sellQty > 0n) {
-        const clientId = 'o' + (++orderCounter);
-        pendingSell = { clientId, trancheIds: markedIds };
+      if (targetIds.length > 0 && totalSellQty > 0n) {
+        const clientId = 'o' + (++sequenceOrderCount);
+        pendingSellIntent = { identifier: clientId, holdingIds: targetIds };
         return [{
           side: 'sell',
           symbol: 'CBBTC',
-          qty: sellQty,
+          qty: totalSellQty,
           max_slippage_bps: 200,
           client_id: clientId,
         }];
       }
     }
 
-    // ENTRIES (only if state.seq <= 1300)
+    // 3. Evaluate entry conditions (only when bar sequence is within allowed limit)
     if (state.seq <= 1300) {
-      let high60 = 0n;
-      if (closes.length >= 60) {
-        const last60 = closes.slice(-60);
-        high60 = last60.reduce((max, c) => (c > max ? c : max), last60[0]!);
-      }
+      const stats = computeWindowStats(priceHistory);
+      const dip60Bps = priceHistory.length >= 60 ? (stats.high60 - currentClose) * 10000n / stats.high60 : 0n;
+      const dip30Bps = priceHistory.length >= 30 ? (stats.high30 - currentClose) * 10000n / stats.high30 : 0n;
+      const bounceBps = priceHistory.length >= 10 ? (currentClose - stats.low10) * 10000n / stats.low10 : 0n;
 
-      let high30 = 0n;
-      if (closes.length >= 30) {
-        const last30 = closes.slice(-30);
-        high30 = last30.reduce((max, c) => (c > max ? c : max), last30[0]!);
-      }
+      const positionRecord = state.positions.get('CBBTC');
+      const positionQty = positionRecord ? positionRecord.qty : 0n;
+      const positionVal = positionQty > 0n ? state.value('CBBTC', positionQty) : 0n;
+      const minimumNotionalThreshold = BigInt(state.hello.fees.min_notional_quote_units ?? 1_000_000n);
 
-      let low10 = 0n;
-      if (closes.length >= 10) {
-        const last10 = closes.slice(-10);
-        low10 = last10.reduce((min, c) => (c < min ? c : min), last10[0]!);
-      }
-
-      const dip60Bps = closes.length >= 60 ? (high60 - close) * 10000n / high60 : 0n;
-      const dip30Bps = closes.length >= 30 ? (high30 - close) * 10000n / high30 : 0n;
-      const bounceBps = closes.length >= 10 ? (close - low10) * 10000n / low10 : 0n;
-
-      const pos = state.positions.get('CBBTC');
-      const posQty = pos ? pos.qty : 0n;
-      const posValue = posQty > 0n ? state.value('CBBTC', posQty) : 0n;
-      const minNotional = BigInt(state.hello.fees.min_notional_quote_units ?? 1_000_000n);
-
-      // CORE entry
-      if (closes.length >= 60 && dip60Bps >= 100n && bounceBps >= 5n && posValue < state.equity) {
-        const notional = state.cash;
-        if (notional >= minNotional && state.weightRoom('CBBTC') >= minNotional) {
-          const clientId = 'o' + (++orderCounter);
-          pendingBuy = { clientId, tp: 120n, trail: 150n, timeout: 480 };
+      // Core entry evaluation
+      if (priceHistory.length >= 60 && dip60Bps >= 100n && bounceBps >= 5n && positionVal < state.equity) {
+        const allocationAmount = state.cash;
+        if (allocationAmount >= minimumNotionalThreshold && state.weightRoom('CBBTC') >= minimumNotionalThreshold) {
+          const clientId = 'o' + (++sequenceOrderCount);
+          pendingBuyIntent = { identifier: clientId, takeProfitBps: 120n, trailingBps: 150n, timeoutBars: 480 };
           return [{
             side: 'buy',
             symbol: 'CBBTC',
-            notional_quote_units: notional,
+            notional_quote_units: allocationAmount,
             max_slippage_bps: 200,
             client_id: clientId,
           }];
         }
       }
 
-      // FALLBACK entry
-      if (posQty === 0n && (state.seq - lastTradeBar) >= 300 && closes.length >= 30 && dip30Bps >= 70n && bounceBps >= 10n) {
-        const notional = (state.cash * 25n) / 100n;
-        if (notional >= minNotional && state.weightRoom('CBBTC') >= minNotional) {
-          const clientId = 'o' + (++orderCounter);
-          pendingBuy = { clientId, tp: 60n, trail: 60n, timeout: 240 };
+      // Fallback entry evaluation
+      if (positionQty === 0n && (state.seq - lastExecutionBar) >= 300 && priceHistory.length >= 30 && dip30Bps >= 70n && bounceBps >= 10n) {
+        const allocationAmount = (state.cash * 25n) / 100n;
+        if (allocationAmount >= minimumNotionalThreshold && state.weightRoom('CBBTC') >= minimumNotionalThreshold) {
+          const clientId = 'o' + (++sequenceOrderCount);
+          pendingBuyIntent = { identifier: clientId, takeProfitBps: 60n, trailingBps: 60n, timeoutBars: 240 };
           return [{
             side: 'buy',
             symbol: 'CBBTC',
-            notional_quote_units: notional,
+            notional_quote_units: allocationAmount,
             max_slippage_bps: 200,
             client_id: clientId,
           }];
